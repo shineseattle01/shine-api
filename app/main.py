@@ -1,51 +1,94 @@
-from fastapi import FastAPI, Depends, Header, HTTPException, Query
-from pydantic import BaseModel
-from datetime import datetime
-from supabase import create_client, Client
+# app/main.py
+from __future__ import annotations
+
 import os
+from collections import defaultdict
+from datetime import datetime
+from typing import Optional
 
-app = FastAPI(title="Shine API", version="1.0.0")
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel
+from supabase import Client, create_client
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-API_KEY_READ = os.environ.get("API_KEY_READ")
-API_KEY_WRITE = os.environ.get("API_KEY_WRITE")
+# ------------------------------------------------------------
+# Config / bootstrap
+# ------------------------------------------------------------
+def _getenv(name: str, required: bool = True) -> str:
+    val = os.getenv(name)
+    if required and not val:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return val or ""
+
+SUPABASE_URL = _getenv("SUPABASE_URL")
+SUPABASE_KEY = _getenv("SUPABASE_SERVICE_ROLE_KEY")
+API_KEY_READ = os.getenv("API_KEY_READ")          # leitura
+API_KEY_WRITE = os.getenv("API_KEY_WRITE")        # escrita
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --------- Autorização simples por chave no header ---------
+app = FastAPI(
+    title="Shine API",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+
+# ------------------------------------------------------------
+# Autorização simples via header X-API-Key
+# ------------------------------------------------------------
 def require_key(read_only: bool):
-    async def checker(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+    async def checker(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
         if read_only:
+            # aceita READ ou WRITE para chamadas de leitura
             if x_api_key not in {API_KEY_READ, API_KEY_WRITE}:
                 raise HTTPException(status_code=401, detail="Invalid API key (read)")
         else:
+            # somente WRITE para mutações
             if x_api_key != API_KEY_WRITE:
                 raise HTTPException(status_code=401, detail="Invalid API key (write)")
     return checker
+
+
+# ------------------------------------------------------------
+# Modelos
+# ------------------------------------------------------------
+class Event(BaseModel):
+    id: str
+    title: Optional[str] = None
+    description: Optional[str] = None
+    location: Optional[str] = None
+    starts_at: str
+    ends_at: str
+    all_day: bool = False
+    source_id: Optional[str] = None
+
+
+# ------------------------------------------------------------
+# Rotas básicas
+# ------------------------------------------------------------
+@app.get("/")
+async def root():
+    return {"name": "Shine API", "version": "1.0.0"}
 
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-# --------- Agenda ---------
-class Event(BaseModel):
-    id: str
-    title: str | None = None
-    description: str | None = None
-    location: str | None = None
-    starts_at: str
-    ends_at: str
-    all_day: bool = False
-    source_id: str | None = None
 
+# ------------------------------------------------------------
+# Agenda
+# ------------------------------------------------------------
 @app.get("/agenda")
 async def agenda(
-    range_start: datetime = Query(...),
-    range_end: datetime = Query(...),
-    source_id: str | None = Query(None),
+    range_start: datetime = Query(..., description="ISO datetime (UTC)"),
+    range_end: datetime = Query(..., description="ISO datetime (UTC)"),
+    source_id: Optional[str] = Query(None, description="Filtra por source_id"),
     _=Depends(require_key(read_only=True)),
 ):
+    """
+    Lista eventos em `core.calendar_events` dentro do intervalo.
+    """
     query = (
         supabase.table("core.calendar_events")
         .select("id,title,description,location,starts_at,ends_at,all_day,source_id")
@@ -55,12 +98,22 @@ async def agenda(
     )
     if source_id:
         query = query.eq("source_id", source_id)
+
     resp = query.execute()
     return resp.data or []
 
-# --------- KPIs ---------
+
+# ------------------------------------------------------------
+# KPIs
+# ------------------------------------------------------------
 @app.get("/kpis/daily")
-async def kpis_daily(day: datetime = Query(...), _=Depends(require_key(read_only=True))):
+async def kpis_daily(
+    day: datetime = Query(..., description="YYYY-MM-DD ou datetime"),
+    _=Depends(require_key(read_only=True)),
+):
+    """
+    Retorna KPIs diários para `day` em `core.kpis_daily`.
+    """
     dstr = day.date().isoformat()
     resp = (
         supabase.table("core.kpis_daily")
@@ -70,10 +123,54 @@ async def kpis_daily(day: datetime = Query(...), _=Depends(require_key(read_only
     )
     return resp.data or []
 
-# --------- Ingestão iCal ---------
-from app.services.ical_ingest import ingest_all_sources
+
+@app.get("/kpis/summary")
+async def kpis_summary(
+    start: datetime = Query(..., description="Início (YYYY-MM-DD ou datetime)"),
+    end: datetime = Query(..., description="Fim (YYYY-MM-DD ou datetime)"),
+    _=Depends(require_key(read_only=True)),
+):
+    """
+    Agrega KPIs diários no intervalo [start, end] somando por 'metric'.
+    Espera linhas no formato: (day, metric, value).
+    """
+    resp = (
+        supabase.table("core.kpis_daily")
+        .select("day,metric,value")
+        .gte("day", start.date().isoformat())
+        .lte("day", end.date().isoformat())
+        .execute()
+    )
+    rows = resp.data or []
+
+    agg = defaultdict(float)
+    for r in rows:
+        m = r.get("metric")
+        v = r.get("value")
+        if m is not None and isinstance(v, (int, float)):
+            agg[m] += float(v)
+
+    return {
+        "start": start.date().isoformat(),
+        "end": end.date().isoformat(),
+        "totals": {
+            "events_count": agg.get("events_count", 0.0),
+            "hours_scheduled": agg.get("hours_scheduled", 0.0),
+            # adicione outras métricas se existirem
+        },
+    }
+
+
+# ------------------------------------------------------------
+# Ingestão iCal
+# ------------------------------------------------------------
+from app.services.ical_ingest import ingest_all_sources  # mantém teu path
 
 @app.post("/ical/ingest")
 async def ical_ingest(_=Depends(require_key(read_only=False))):
+    """
+    Dispara a ingestão de todas as fontes iCal configuradas.
+    Requer X-API-Key de escrita.
+    """
     total = await ingest_all_sources(supabase)
     return {"ingested": total}
