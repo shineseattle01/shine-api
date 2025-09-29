@@ -9,8 +9,7 @@ from typing import Optional, Callable
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 from supabase import Client, create_client
-from postgrest.exceptions import APIError  # para tratar mensagens do PostgREST
-
+from postgrest.exceptions import APIError  # erros vindos do PostgREST
 
 # ------------------------------------------------------------
 # Config / bootstrap
@@ -28,6 +27,13 @@ API_KEY_WRITE = os.getenv("API_KEY_WRITE")  # escrita
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ✅ força o PostgREST a usar o schema 'public' como padrão
+try:
+    supabase.postgrest.schema("public")
+except Exception:
+    # algumas versões não expõem .postgrest; se falhar, seguimos com o default (já é 'public')
+    pass
+
 app = FastAPI(
     title="Shine API",
     version="1.0.0",
@@ -35,25 +41,21 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-
 # ------------------------------------------------------------
 # Autorização simples via header X-API-Key
 # ------------------------------------------------------------
 def require_key(read_only: bool) -> Callable:
     async def checker(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
         if read_only:
-            # aceita READ ou WRITE para chamadas de leitura
             if x_api_key not in {API_KEY_READ, API_KEY_WRITE}:
                 raise HTTPException(status_code=401, detail="Invalid API key (read)")
         else:
-            # somente WRITE para mutações
             if x_api_key != API_KEY_WRITE:
                 raise HTTPException(status_code=401, detail="Invalid API key (write)")
     return checker
 
-
 # ------------------------------------------------------------
-# Modelos (se precisar tipar respostas)
+# Modelos (se quiser tipar respostas)
 # ------------------------------------------------------------
 class Event(BaseModel):
     id: str
@@ -64,7 +66,6 @@ class Event(BaseModel):
     ends_at: str
     all_day: bool = False
     source_id: Optional[str] = None
-
 
 # ------------------------------------------------------------
 # Rotas básicas
@@ -77,20 +78,8 @@ async def root():
 async def health():
     return {"ok": True}
 
-
 # ------------------------------------------------------------
-# Helpers de acesso ao schema "core"
-# ------------------------------------------------------------
-def from_core(table: str):
-    """
-    Retorna um builder para a tabela no schema 'core'.
-    Evita erros do tipo 'Could not find the table public.core.xyz'.
-    """
-    return supabase.postgrest.schema("core").from_(table)
-
-
-# ------------------------------------------------------------
-# Agenda
+# Agenda (lê eventos do schema PUBLIC)
 # ------------------------------------------------------------
 @app.get("/agenda")
 async def agenda(
@@ -100,28 +89,43 @@ async def agenda(
     _=Depends(require_key(read_only=True)),
 ):
     """
-    Lista eventos em `core.calendar_events` dentro do intervalo.
+    Lista eventos na tabela public.calendar_events dentro do intervalo.
+    Espera colunas: id, title, description, location, start, end, source_id, (opcional) all_day.
     """
     try:
-        pg = from_core("calendar_events")
         query = (
-            pg.select("id,title,description,location,starts_at,ends_at,all_day,source_id")
-              .gte("starts_at", range_start.isoformat())
-              .lte("ends_at", range_end.isoformat())
-              .order("starts_at")
+            supabase
+            .table("calendar_events")  # public por padrão
+            .select("id,title,description,location,start,end,source_id,all_day")
+            .gte("start", range_start.isoformat())
+            .lte("end", range_end.isoformat())
+            .order("start")
         )
         if source_id:
             query = query.eq("source_id", source_id)
 
         resp = query.execute()
-        return resp.data or []
+        data = resp.data or []
+
+        normalized = []
+        for r in data:
+            normalized.append({
+                "id": r.get("id"),
+                "title": r.get("title"),
+                "description": r.get("description"),
+                "location": r.get("location"),
+                "starts_at": r.get("start"),
+                "ends_at": r.get("end"),
+                "all_day": bool(r.get("all_day", False)),
+                "source_id": r.get("source_id"),
+            })
+        return normalized
+
     except APIError as e:
-        # Exibe mensagem clara quando tabela/coluna não existe ou outro erro do PostgREST
         raise HTTPException(status_code=500, detail={"postgrest": e.args[0] if e.args else str(e)})
 
-
 # ------------------------------------------------------------
-# KPIs
+# KPIs (tabelas no schema PUBLIC)
 # ------------------------------------------------------------
 @app.get("/kpis/daily")
 async def kpis_daily(
@@ -129,16 +133,19 @@ async def kpis_daily(
     _=Depends(require_key(read_only=True)),
 ):
     """
-    Retorna KPIs diários para `day` em `core.kpis_daily`.
+    Retorna KPIs diários para `day` na tabela public.kpis_daily.
     """
     try:
         dstr = day.date().isoformat()
-        pg = from_core("kpis_daily")
-        resp = pg.select("metric,value,meta").eq("day", dstr).execute()
+        resp = (
+            supabase.table("kpis_daily")  # public por padrão
+            .select("metric,value,meta")
+            .eq("day", dstr)
+            .execute()
+        )
         return resp.data or []
     except APIError as e:
         raise HTTPException(status_code=500, detail={"postgrest": e.args[0] if e.args else str(e)})
-
 
 @app.get("/kpis/summary")
 async def kpis_summary(
@@ -151,12 +158,12 @@ async def kpis_summary(
     Espera linhas no formato: (day, metric, value).
     """
     try:
-        pg = from_core("kpis_daily")
         resp = (
-            pg.select("day,metric,value")
-              .gte("day", start.date().isoformat())
-              .lte("day", end.date().isoformat())
-              .execute()
+            supabase.table("kpis_daily")  # public por padrão
+            .select("day,metric,value")
+            .gte("day", start.date().isoformat())
+            .lte("day", end.date().isoformat())
+            .execute()
         )
         rows = resp.data or []
 
@@ -173,26 +180,9 @@ async def kpis_summary(
             "totals": {
                 "events_count": agg.get("events_count", 0.0),
                 "hours_scheduled": agg.get("hours_scheduled", 0.0),
-                # adicione outras métricas se existirem
             },
         }
     except APIError as e:
         raise HTTPException(status_code=500, detail={"postgrest": e.args[0] if e.args else str(e)})
 
-
-# ------------------------------------------------------------
-# Ingestão iCal
-# ------------------------------------------------------------
-from app.services.ical_ingest import ingest_all_sources  # mantém teu path
-
-@app.post("/ical/ingest")
-async def ical_ingest(_=Depends(require_key(read_only=False))):
-    """
-    Dispara a ingestão de todas as fontes iCal configuradas.
-    Requer X-API-Key de escrita.
-    """
-    try:
-        total = await ingest_all_sources(supabase)
-        return {"ingested": total}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# ---------------------------
