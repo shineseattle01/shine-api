@@ -1,0 +1,17 @@
+name: iCal Ingest (scheduled)
+
+on:
+  schedule:
+    # roda a cada 15 minutos (UTC)
+    - cron: "*/15 * * * *"
+  workflow_dispatch: # permite rodar manualmente pelo botão no GitHub
+
+jobs:
+  run-ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call Shine API /ical/ingest
+        run: |
+          curl -sS -X POST \
+            -H "X-API-Key: ${{ secrets.API_KEY_WRITE }}" \
+            https://shine-api-1.onrender.com/ical/ingest
