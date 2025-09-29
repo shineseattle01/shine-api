@@ -7,3 +7,4 @@ ics==0.7.2
 python-dateutil==2.9.0.post0
 pytz==2025.2
 icalendar==5.0.12
+requests>=2.31
